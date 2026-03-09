@@ -1,0 +1,43 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — stores alert history for deduplication / cooldown logic
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       worldcup
+      POSTGRES_USER:     worldcup
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Any .sql file here runs once on a fresh DB (schema init)
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U worldcup -d worldcup"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      # Expose locally so you can inspect with TablePlus / pgAdmin / psql
+      - "5433:5432"
+
+  # ---------------------------------------------------------------------------
+  # World Cup ticket bot
+  # ---------------------------------------------------------------------------
+  worldcup:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://worldcup:${POSTGRES_PASSWORD}@postgres:5432/worldcup
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  postgres-data:    # persists alert history across container restarts / rebuilds
