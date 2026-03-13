@@ -319,14 +319,35 @@ def fetch_seatgeek() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+_STUBHUB_DATE_RE = re.compile(r"-tickets-(\d{1,2}-\d{1,2}-(\d{4}))/")
+
+
+def _parse_stubhub_price(formatted: str) -> float | None:
+    """Parse a price string like '$142' or '$1,234' into a float."""
+    try:
+        return float(re.sub(r"[^\d.]", "", formatted))
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_stubhub_date(event_url: str) -> str:
+    """Extract ISO date from StubHub event URL, e.g. tickets-6-15-2026 → 2026-06-15."""
+    m = _STUBHUB_DATE_RE.search(event_url)
+    if m:
+        parts = m.group(1).split("-")
+        if len(parts) == 3:
+            month, day, year = parts
+            return f"{year}-{int(month):02d}-{int(day):02d}"
+    return ""
+
+
 def fetch_stubhub() -> list[dict]:
     """
     Scrape StubHub's search results page for World Cup tickets.
 
-    StubHub is a Next.js app that embeds its search payload in a
-    <script id="__NEXT_DATA__"> tag. We extract that JSON and navigate
-    to the event card list.  If the page structure changes, this adapter
-    logs a warning and returns [] without crashing the poll.
+    StubHub embeds its search payload in <script id="index-data">.
+    Structure: eventGrids[key].items[i] with fields:
+      name, venueName, venueCity, venueStateProvince, formattedMinPrice, url
     """
     url = "https://www.stubhub.com/search?q=FIFA+World+Cup+2026+MetLife+Stadium"
     try:
@@ -337,49 +358,48 @@ def fetch_stubhub() -> list[dict]:
 
     listings: list[dict] = []
     try:
-        data = _extract_next_data(html)
-        if not data:
-            logger.warning("StubHub: __NEXT_DATA__ not found — site structure may have changed.")
+        soup = BeautifulSoup(html, "html.parser")
+        tag = soup.find("script", id="index-data")
+        if not tag or not tag.string:
+            logger.warning("StubHub: index-data script not found — site structure may have changed.")
             return []
 
-        props = data.get("props", {}).get("pageProps", {})
+        data = json.loads(tag.string)
+        grids = data.get("eventGrids", {})
+        if not grids:
+            logger.warning("StubHub: no eventGrids in index-data.")
+            return []
 
-        # StubHub's pageProps key for search results has varied — try several paths.
-        events_raw = (
-            props.get("events")
-            or props.get("searchResults", {}).get("events")
-            or props.get("initialData", {}).get("events")
-            or []
-        )
+        # eventGrids is a dict; take the first value
+        grid = next(iter(grids.values())) if isinstance(grids, dict) else grids[0]
+        events_raw = grid.get("items", []) if isinstance(grid, dict) else []
 
         for ev in events_raw:
-            name = ev.get("name") or ev.get("description", "")
+            name = ev.get("name", "")
             if not any(kw in name.lower() for kw in _WC_KEYWORDS):
                 continue
 
-            venue_name = (ev.get("venue") or {}).get("name", "")
-            if not any(kw in venue_name.lower() for kw in _VENUE_KEYWORDS):
+            venue_name = ev.get("venueName", "")
+            venue_city = ev.get("venueCity", "")
+            venue_str = f"{venue_name} {venue_city}".lower()
+            if not any(kw in venue_str for kw in _VENUE_KEYWORDS):
                 continue
 
-            raw_price = ev.get("minTicketPrice") or ev.get("minPrice") or ev.get("ticketInfo", {}).get("minPrice")
-            if not raw_price:
+            price = _parse_stubhub_price(ev.get("formattedMinPrice", ""))
+            if price is None:
                 continue
 
-            date = (ev.get("eventDateLocal") or ev.get("startDate", ""))[:10]
-            event_url = ev.get("eventUrl") or ev.get("url", "")
-            if event_url and not event_url.startswith("http"):
-                event_url = "https://www.stubhub.com" + event_url
+            event_url = ev.get("url", "")
+            date = _parse_stubhub_date(event_url)
 
-            listings.append(
-                {
-                    "game": name,
-                    "date": date,
-                    "section": "any",
-                    "price": float(raw_price),
-                    "url": event_url,
-                    "source": "stubhub",
-                }
-            )
+            listings.append({
+                "game": name,
+                "date": date,
+                "section": "any",
+                "price": price,
+                "url": event_url,
+                "source": "stubhub",
+            })
     except Exception as exc:
         logger.warning("StubHub data parsing failed: %s", exc)
 
