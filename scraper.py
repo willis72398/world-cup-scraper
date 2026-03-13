@@ -328,7 +328,7 @@ def fetch_stubhub() -> list[dict]:
     to the event card list.  If the page structure changes, this adapter
     logs a warning and returns [] without crashing the poll.
     """
-    url = "https://www.stubhub.com/find/s/?q=FIFA+World+Cup+2026+MetLife+Stadium"
+    url = "https://www.stubhub.com/search?q=FIFA+World+Cup+2026+MetLife+Stadium"
     try:
         html = _fetch_html(url)
     except Exception as exc:
