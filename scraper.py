@@ -14,18 +14,18 @@ Five adapters are implemented, each returning a list of normalized listing dicts
 
 Adapter strategy
 ----------------
-  Ticketmaster  — official Discovery API (JSON, no scraping)
-  SeatGeek      — official public API   (JSON, no scraping)
-  StubHub       — __NEXT_DATA__ JSON embedded in Next.js HTML page
-  Vivid Seats   — __NEXT_DATA__ JSON embedded in Next.js HTML page
-  Gametime      — __NEXT_DATA__ JSON embedded in Next.js HTML page
+  Ticketmaster  — Playwright scrape of search results page (__NEXT_DATA__)
+  SeatGeek      — Playwright scrape of performer page (__NEXT_DATA__)
+  StubHub       — requests scrape, <script id="index-data"> JSON blob
+  Vivid Seats   — requests scrape, __NEXT_DATA__ JSON embedded in page
+  Gametime      — Gametime mobile API (public, no auth required)
 
-All three HTTP-scraped adapters fail gracefully: if the page structure has
-changed or the site blocks the request, the adapter logs a warning and returns
-an empty list.  The other adapters continue unaffected.
+All adapters fail gracefully: if a page structure changes or a request is
+blocked, the adapter logs a warning and returns an empty list so the others
+continue unaffected.
 
-A 7-second inter-request delay is inserted between the three scraped sites to
-avoid triggering rate-limit detection on the bot's residential IP.
+A 7-second inter-request delay is inserted between adapters to avoid
+triggering rate-limit detection.
 """
 
 import json
@@ -36,6 +36,7 @@ import time
 
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 logger = logging.getLogger(__name__)
 
@@ -180,135 +181,179 @@ def _extract_json_ld(html: str) -> list[dict]:
     return results
 
 
+_PLAYWRIGHT_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
+
+def _fetch_html_playwright(url: str, wait_until: str = "networkidle") -> str:
+    """Render a URL in a headless Chromium browser and return the page HTML."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(user_agent=_PLAYWRIGHT_UA)
+        page = context.new_page()
+        try:
+            page.goto(url, timeout=30_000, wait_until=wait_until)
+        except Exception as exc:
+            logger.warning("Playwright navigation warning (%s): %s", url, exc)
+        html = page.content()
+        context.close()
+        browser.close()
+    return html
+
+
 # ---------------------------------------------------------------------------
-# Ticketmaster adapter  (official Discovery API)
+# Ticketmaster adapter  (Playwright scrape — TM blocks plain HTTP)
 # ---------------------------------------------------------------------------
 
 
 def fetch_ticketmaster() -> list[dict]:
     """
-    Query the Ticketmaster Discovery API for FIFA World Cup events in NJ.
-    Requires TICKETMASTER_API_KEY to be set.
+    Scrape Ticketmaster's search page for FIFA World Cup events at MetLife.
 
-    API docs: https://developer.ticketmaster.com/products-and-docs/apis/discovery-api/v2/
+    TM uses Next.js; event data is in __NEXT_DATA__ under
+    props.pageProps.initialReduxState.api.  We try several known paths and
+    fall back gracefully if the structure changes.
     """
-    api_key = os.getenv("TICKETMASTER_API_KEY", "").strip()
-    if not api_key:
-        logger.warning("TICKETMASTER_API_KEY not set — skipping Ticketmaster.")
-        return []
-
+    search_url = "https://www.ticketmaster.com/search?q=FIFA+World+Cup+2026+MetLife+Stadium"
     try:
-        data = _fetch_json(
-            "https://app.ticketmaster.com/discovery/v2/events.json",
-            params={
-                "apikey": api_key,
-                "keyword": "FIFA World Cup",
-                "stateCode": "NJ",
-                "classificationName": "sports",
-                "size": 50,
-            },
-        )
+        html = _fetch_html_playwright(search_url)
     except Exception as exc:
-        logger.error("Ticketmaster API error: %s", exc)
+        logger.error("Ticketmaster Playwright error: %s", exc)
         return []
 
-    events = data.get("_embedded", {}).get("events", [])
     listings: list[dict] = []
+    try:
+        data = _extract_next_data(html)
+        redux = (
+            data.get("props", {})
+            .get("pageProps", {})
+            .get("initialReduxState", {})
+        )
 
-    for event in events:
-        name = event.get("name", "")
-        venues = event.get("_embedded", {}).get("venues", [{}])
-        venue_name = venues[0].get("name", "") if venues else ""
+        # TM stores search results under api.search.events._embedded.events
+        api = redux.get("api", {})
+        search = api.get("search", {}) if isinstance(api, dict) else {}
+        embedded = (
+            search.get("events", {}).get("_embedded", {})
+            if isinstance(search, dict)
+            else {}
+        )
+        raw_events = embedded.get("events", []) if isinstance(embedded, dict) else []
 
-        if not _is_world_cup_at_metlife(name, venue_name):
-            continue
+        if not raw_events:
+            logger.debug(
+                "Ticketmaster: no events at expected path; redux keys: %s",
+                list(redux.keys()) if isinstance(redux, dict) else type(redux),
+            )
 
-        date = event.get("dates", {}).get("start", {}).get("localDate", "")
-        price_ranges = event.get("priceRanges", [])
-        if not price_ranges:
-            logger.debug("Ticketmaster event %r has no priceRanges — skipping.", name)
-            continue
+        for event in raw_events:
+            if not isinstance(event, dict):
+                continue
+            name = event.get("name", "")
+            venues = event.get("_embedded", {}).get("venues", [{}])
+            venue_name = venues[0].get("name", "") if venues else ""
 
-        min_price = min(pr.get("min", 9999) for pr in price_ranges)
-        url = event.get("url", "")
+            if not _is_world_cup_at_metlife(name, venue_name):
+                continue
 
-        # TM Discovery API returns event-level ranges, not per-section data.
-        # We report section as "any"; main.py compares against the upper_deck
-        # threshold as the conservative baseline.
-        listings.append(
-            {
+            date = event.get("dates", {}).get("start", {}).get("localDate", "")
+            price_ranges = event.get("priceRanges") or []
+            if not price_ranges:
+                continue
+
+            min_price = min(pr.get("min", 9999) for pr in price_ranges if isinstance(pr, dict))
+            url = event.get("url", "")
+
+            listings.append({
                 "game": name,
                 "date": date,
                 "section": "any",
                 "price": float(min_price),
                 "url": url,
                 "source": "ticketmaster",
-            }
-        )
+            })
+    except Exception as exc:
+        logger.warning("Ticketmaster data parsing failed: %s", exc)
 
     logger.info("Ticketmaster: %d World Cup listing(s) at MetLife.", len(listings))
     return listings
 
 
 # ---------------------------------------------------------------------------
-# SeatGeek adapter  (official public API)
+# SeatGeek adapter  (Playwright scrape — SeatGeek blocks plain HTTP)
 # ---------------------------------------------------------------------------
 
 
 def fetch_seatgeek() -> list[dict]:
     """
-    Query the SeatGeek public API for FIFA World Cup events at MetLife.
-    Requires SEATGEEK_CLIENT_ID (and optionally SEATGEEK_CLIENT_SECRET).
+    Scrape SeatGeek's FIFA World Cup performer page for MetLife events.
 
-    API docs: https://platform.seatgeek.com/
+    SeatGeek uses Next.js; event data lives in __NEXT_DATA__ under
+    props.pageProps.  We try several known key variants.
     """
-    client_id = os.getenv("SEATGEEK_CLIENT_ID", "").strip()
-    if not client_id:
-        logger.warning("SEATGEEK_CLIENT_ID not set — skipping SeatGeek.")
-        return []
-
-    params: dict = {
-        "q": "FIFA World Cup 2026",
-        "venue.state": "NJ",
-        "per_page": 25,
-        "client_id": client_id,
-    }
-    client_secret = os.getenv("SEATGEEK_CLIENT_SECRET", "").strip()
-    if client_secret:
-        params["client_secret"] = client_secret
-
+    url = "https://seatgeek.com/fifa-world-cup-tickets"
     try:
-        data = _fetch_json("https://api.seatgeek.com/2/events", params=params)
+        html = _fetch_html_playwright(url)
     except Exception as exc:
-        logger.error("SeatGeek API error: %s", exc)
+        logger.error("SeatGeek Playwright error: %s", exc)
         return []
 
     listings: list[dict] = []
+    try:
+        data = _extract_next_data(html)
+        props = data.get("props", {}).get("pageProps", {})
 
-    for event in data.get("events", []):
-        title = event.get("title", "")
-        venue_name = event.get("venue", {}).get("name", "")
+        events = (
+            props.get("events")
+            or props.get("productions")
+            or props.get("searchResults")
+            or props.get("initialData", {}).get("events")
+            or []
+        )
 
-        if not _is_world_cup_at_metlife(title, venue_name):
-            continue
+        if not events:
+            logger.debug(
+                "SeatGeek: no events found; pageProps keys: %s", list(props.keys())
+            )
 
-        min_price = event.get("stats", {}).get("lowest_price")
-        if not min_price:
-            continue
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            title = event.get("title", "") or event.get("name", "")
+            venue_name = (event.get("venue") or {}).get("name", "")
 
-        date_str = (event.get("datetime_local") or "")[:10]
-        url = event.get("url", "")
+            if not _is_world_cup_at_metlife(title, venue_name):
+                continue
 
-        listings.append(
-            {
+            min_price = (
+                (event.get("stats") or {}).get("lowest_price")
+                or event.get("lowest_price")
+                or event.get("min_price")
+            )
+            if not min_price:
+                continue
+
+            date_str = (event.get("datetime_local") or event.get("date", ""))[:10]
+            url_field = event.get("url") or event.get("seo_url") or ""
+            event_url = (
+                f"https://seatgeek.com{url_field}"
+                if url_field and not url_field.startswith("http")
+                else url_field or "https://seatgeek.com"
+            )
+
+            listings.append({
                 "game": title,
                 "date": date_str,
                 "section": "any",
                 "price": float(min_price),
-                "url": url,
+                "url": event_url,
                 "source": "seatgeek",
-            }
-        )
+            })
+    except Exception as exc:
+        logger.warning("SeatGeek data parsing failed: %s", exc)
 
     logger.info("SeatGeek: %d World Cup listing(s) at MetLife.", len(listings))
     return listings
@@ -477,69 +522,75 @@ def fetch_vividseats() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Gametime adapter  (__NEXT_DATA__ scrape)
+# Gametime adapter  (mobile API — no auth required)
 # ---------------------------------------------------------------------------
+
+# Performer ID for "2026 FIFA World Cup" on Gametime's mobile API.
+_GAMETIME_PERFORMER_ID = "66f70bca07991b85a6c55ad9"
 
 
 def fetch_gametime() -> list[dict]:
     """
-    Scrape Gametime for World Cup tickets.
+    Query Gametime's mobile API for FIFA World Cup events at MetLife Stadium.
 
-    Gametime renders its search page via Next.js; we attempt __NEXT_DATA__
-    extraction and fall back gracefully on failure.
+    Uses the undocumented-but-public mobile API endpoint.  Prices are returned
+    in cents and converted to dollars.  Only NJ events are requested so the
+    venue filter is just a sanity check.
     """
-    url = "https://gametime.co/search?q=FIFA+World+Cup+2026"
     try:
-        html = _fetch_html(url)
+        data = _fetch_json(
+            "https://mobile.gametime.co/v1/events",
+            params={
+                "performer_id": _GAMETIME_PERFORMER_ID,
+                "venue_state": "NJ",
+                "page": 1,
+                "per_page": 50,
+            },
+        )
     except Exception as exc:
-        logger.error("Gametime fetch error: %s", exc)
+        logger.error("Gametime API error: %s", exc)
         return []
 
     listings: list[dict] = []
-    try:
-        data = _extract_next_data(html)
-        props = data.get("props", {}).get("pageProps", {})
+    for item in data.get("events", []):
+        if not isinstance(item, dict):
+            continue
+        ev = item.get("event", {})
+        venue = item.get("venue", {})
 
-        events = (
-            props.get("events")
-            or props.get("results")
-            or props.get("initialData", {}).get("events")
-            or []
+        name = ev.get("name", "")
+        if not any(kw in name.lower() for kw in _WC_KEYWORDS):
+            continue
+
+        venue_name = venue.get("name", "") if isinstance(venue, dict) else ""
+        if not any(kw in venue_name.lower() for kw in _VENUE_KEYWORDS):
+            continue
+
+        min_price_obj = ev.get("min_price") or {}
+        price_cents = (
+            min_price_obj.get("total") or min_price_obj.get("prefee")
+            if isinstance(min_price_obj, dict)
+            else None
+        )
+        if not price_cents:
+            continue
+
+        date = (ev.get("datetime_local") or "")[:10]
+        event_id = ev.get("id", "")
+        event_url = (
+            f"https://gametime.co/events/{event_id}"
+            if event_id
+            else "https://gametime.co"
         )
 
-        for ev in events:
-            name = ev.get("name", "")
-            if not any(kw in name.lower() for kw in _WC_KEYWORDS):
-                continue
-
-            venue_name = (ev.get("venue") or {}).get("name", "")
-            if not any(kw in venue_name.lower() for kw in _VENUE_KEYWORDS):
-                continue
-
-            min_price = ev.get("min_price") or ev.get("minPrice")
-            if not min_price:
-                continue
-
-            date = (ev.get("starts_at") or ev.get("date", ""))[:10]
-            event_id = ev.get("id", "")
-            event_url = (
-                f"https://gametime.co/events/{event_id}"
-                if event_id
-                else "https://gametime.co"
-            )
-
-            listings.append(
-                {
-                    "game": name,
-                    "date": date,
-                    "section": "any",
-                    "price": float(min_price),
-                    "url": event_url,
-                    "source": "gametime",
-                }
-            )
-    except Exception as exc:
-        logger.warning("Gametime data parsing failed: %s", exc)
+        listings.append({
+            "game": name,
+            "date": date,
+            "section": "any",
+            "price": price_cents / 100.0,
+            "url": event_url,
+            "source": "gametime",
+        })
 
     logger.info("Gametime: %d World Cup listing(s) at MetLife.", len(listings))
     return listings
@@ -549,12 +600,12 @@ def fetch_gametime() -> list[dict]:
 # Public API
 # ---------------------------------------------------------------------------
 
-# Scraped adapters only — no API keys required.
-# A delay is inserted between each to avoid rate-limit detection.
 _ADAPTERS: list[tuple[str, callable]] = [
-    ("StubHub",     fetch_stubhub),
-    ("Vivid Seats", fetch_vividseats),
-    ("Gametime",    fetch_gametime),
+    ("Ticketmaster", fetch_ticketmaster),
+    ("SeatGeek",     fetch_seatgeek),
+    ("StubHub",      fetch_stubhub),
+    ("Vivid Seats",  fetch_vividseats),
+    ("Gametime",     fetch_gametime),
 ]
 
 
