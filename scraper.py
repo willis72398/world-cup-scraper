@@ -529,30 +529,27 @@ def fetch_gametime() -> list[dict]:
 # Public API
 # ---------------------------------------------------------------------------
 
-# Adapters in execution order.  API-backed adapters run first (fast, reliable).
-# HTTP-scraped adapters run last with inter-request delays between them.
-_ADAPTERS: list[tuple[str, bool, callable]] = [
-    ("Ticketmaster", False, fetch_ticketmaster),   # False = API, no delay needed
-    ("SeatGeek",     False, fetch_seatgeek),
-    ("StubHub",      True,  fetch_stubhub),        # True = scraped, delay after
-    ("Vivid Seats",  True,  fetch_vividseats),
-    ("Gametime",     True,  fetch_gametime),
+# Scraped adapters only — no API keys required.
+# A delay is inserted between each to avoid rate-limit detection.
+_ADAPTERS: list[tuple[str, callable]] = [
+    ("StubHub",     fetch_stubhub),
+    ("Vivid Seats", fetch_vividseats),
+    ("Gametime",    fetch_gametime),
 ]
 
 
 def fetch_all() -> list[dict]:
     """
-    Poll all five sites and return a combined list of normalized listings.
+    Poll all scraped sites and return a combined list of normalized listings.
 
     Each adapter is isolated — an exception or empty result from one does not
-    affect the others.  A delay is inserted between HTTP-scraped adapters to
-    avoid triggering rate-limit detection.
+    affect the others.  A delay is inserted between adapters to avoid
+    triggering rate-limit detection.
     """
     combined: list[dict] = []
-    prev_was_scraped = False
 
-    for name, is_scraped, fn in _ADAPTERS:
-        if is_scraped and prev_was_scraped:
+    for i, (name, fn) in enumerate(_ADAPTERS):
+        if i > 0:
             logger.debug("Waiting %ds before hitting %s…", _INTER_SITE_DELAY_SECS, name)
             time.sleep(_INTER_SITE_DELAY_SECS)
         try:
@@ -560,7 +557,6 @@ def fetch_all() -> list[dict]:
             combined.extend(results)
         except Exception as exc:
             logger.error("Adapter %s raised unexpectedly: %s", name, exc)
-        prev_was_scraped = is_scraped
 
     logger.info("fetch_all: %d total listing(s) across all sources.", len(combined))
     return combined

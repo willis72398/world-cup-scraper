@@ -86,9 +86,9 @@ POLL_INTERVAL = int(_optional("WORLDCUP_POLL_INTERVAL_MINUTES", "30"))
 # "any" is used when a source only returns event-level min prices (no section
 # data).  We use the upper_deck threshold as the conservative baseline.
 THRESHOLDS: dict[str, float] = {
-    "field_level": float(_optional("WORLDCUP_PRICE_FIELD_LEVEL", "500")),
+    "field_level": float(_optional("WORLDCUP_PRICE_FIELD_LEVEL", "200")),
     "lower_bowl":  float(_optional("WORLDCUP_PRICE_LOWER_BOWL",  "200")),
-    "upper_deck":  float(_optional("WORLDCUP_PRICE_UPPER_DECK",  "100")),
+    "upper_deck":  float(_optional("WORLDCUP_PRICE_UPPER_DECK",  "200")),
 }
 THRESHOLDS["any"] = THRESHOLDS["upper_deck"]
 
