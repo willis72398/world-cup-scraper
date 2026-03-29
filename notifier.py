@@ -33,7 +33,6 @@ import logging
 import smtplib
 from collections import defaultdict
 from datetime import date as date_cls
-from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 logger = logging.getLogger(__name__)
@@ -271,8 +270,8 @@ def _build_digest_html(listings: list[dict]) -> str:
         tp = g["sources"].get("tickpick")
         gt = g["sources"].get("gametime")
 
-        tp_price = f'<a href="{tp["url"]}">${tp["price"]:,.0f}</a>' if tp else "—"
-        gt_price = f'<a href="{gt["url"]}">${gt["price"]:,.0f}</a>' if gt else "—"
+        tp_price = f'<a href="{tp["url"]}" style="color:#1a73e8;text-decoration:underline">${tp["price"]:,.0f}</a>' if tp else "—"
+        gt_price = f'<a href="{gt["url"]}" style="color:#1a73e8;text-decoration:underline">${gt["price"]:,.0f}</a>' if gt else "—"
 
         # Highlight the cheaper source
         if tp and gt:
@@ -334,11 +333,10 @@ def send_digest(
 
     for addr in digest_emails:
         try:
-            msg = MIMEMultipart("alternative")
+            msg = MIMEText(html, "html", "utf-8")
             msg["From"] = gmail_user
             msg["To"] = addr
             msg["Subject"] = f"World Cup 2026 Ticket Prices — {date_cls.today().strftime('%b %-d')}"
-            msg.attach(MIMEText(html, "html"))
 
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
                 server.ehlo()
