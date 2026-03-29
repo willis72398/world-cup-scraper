@@ -36,7 +36,7 @@ import time
 
 from dotenv import find_dotenv, load_dotenv
 
-from notifier import send_alerts
+from notifier import send_alerts, send_digest
 from scraper import fetch_all
 from state import record_alert, should_alert
 
@@ -78,7 +78,13 @@ def _optional(key: str, default: str = "") -> str:
 
 GMAIL_USER = _require("GMAIL_USER")
 GMAIL_APP_PASSWORD = _require("GMAIL_APP_PASSWORD")
-NOTIFY_PHONES = _require("WORLDCUP_NOTIFY_PHONES")
+NOTIFY_PHONES = _optional("WORLDCUP_NOTIFY_PHONES")
+
+DIGEST_EMAILS = [
+    e.strip()
+    for e in _optional("WORLDCUP_DIGEST_EMAILS", "willis72398@gmail.com,d.menash3@gmail.com").split(",")
+    if e.strip()
+]
 
 POLL_INTERVAL = int(_optional("WORLDCUP_POLL_INTERVAL_MINUTES", "30"))
 
@@ -166,7 +172,28 @@ def main() -> None:
         action="store_true",
         help="Run a single poll and exit (useful for testing or CI).",
     )
+    parser.add_argument(
+        "--digest",
+        action="store_true",
+        help="Fetch all listings and send a daily digest email, then exit.",
+    )
     args = parser.parse_args()
+
+    if args.digest:
+        logger.info("Running daily digest…")
+        try:
+            all_listings = fetch_all()
+        except Exception as exc:
+            logger.error("fetch_all raised unexpectedly: %s", exc)
+            return
+        logger.info("Fetched %d listing(s) — sending digest to %s", len(all_listings), DIGEST_EMAILS)
+        send_digest(
+            gmail_user=GMAIL_USER,
+            gmail_app_password=GMAIL_APP_PASSWORD,
+            digest_emails=DIGEST_EMAILS,
+            listings=all_listings,
+        )
+        return
 
     if args.once:
         logger.info("Running in single-poll mode (--once).")
