@@ -1,7 +1,7 @@
 """
 Multi-site ticket scraper for FIFA World Cup 2026 at MetLife Stadium.
 
-Five adapters are implemented, each returning a list of normalized listing dicts:
+Six adapters are implemented, each returning a list of normalized listing dicts:
 
   {
       "game":    "FIFA World Cup 2026 - Match 23",
@@ -18,6 +18,7 @@ Adapter strategy
   SeatGeek      — Playwright scrape of performer page (__NEXT_DATA__)
   StubHub       — requests scrape, <script id="index-data"> JSON blob
   Vivid Seats   — requests scrape, __NEXT_DATA__ JSON embedded in page
+  TickPick      — Playwright scrape of search page (__NEXT_DATA__ / JSON-LD)
   Gametime      — Gametime mobile API (public, no auth required)
 
 All adapters fail gracefully: if a page structure changes or a request is
@@ -522,6 +523,181 @@ def fetch_vividseats() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# TickPick adapter  (search page — __NEXT_DATA__ scrape)
+# ---------------------------------------------------------------------------
+
+
+def _extract_tickpick_rsc_events(html: str) -> list[dict]:
+    """
+    Extract the entityEvents array from TickPick's React Server Component
+    payload.  The data is embedded as double-escaped JSON inside
+    ``self.__next_f.push(...)`` script blocks.
+    """
+    idx = html.find("entityEvents")
+    if idx < 0:
+        return []
+
+    decoded = html[idx:idx + 600_000].replace('\\"', '"')
+    start = decoded.find("[")
+    if start < 0:
+        return []
+
+    depth = 0
+    end = start
+    for i, ch in enumerate(decoded[start:], start):
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+
+    try:
+        return json.loads(decoded[start:end])
+    except json.JSONDecodeError as exc:
+        logger.debug("TickPick RSC JSON parse error: %s", exc)
+        return []
+
+
+def _scrape_tickpick_event_page(url: str) -> dict | None:
+    """
+    Scrape an individual TickPick event page for its name, date, and min price.
+    Returns a partial dict or None on failure.
+    """
+    try:
+        html = _fetch_html_playwright(url)
+    except Exception as exc:
+        logger.warning("TickPick event page error (%s): %s", url, exc)
+        return None
+
+    decoded = html.replace('\\"', '"')
+
+    # Pull stats.min from the RSC payload
+    stats_match = re.search(
+        r'"stats"\s*:\s*\{[^}]*"min"\s*:\s*(\d+(?:\.\d+)?)', decoded
+    )
+    min_price = float(stats_match.group(1)) if stats_match else None
+
+    # Pull name + date from JSON-LD (most reliable on individual pages)
+    name, date_str = "", ""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            ld = json.loads(tag.string or "")
+        except json.JSONDecodeError:
+            continue
+        if isinstance(ld, dict) and ld.get("@type") == "SportsEvent":
+            name = ld.get("name", "")
+            date_str = (ld.get("startDate") or "")[:10]
+            break
+
+    if not min_price or not name:
+        return None
+
+    return {"game": name, "date": date_str, "price": min_price}
+
+
+def fetch_tickpick() -> list[dict]:
+    """
+    Scrape TickPick for all World Cup events at MetLife Stadium.
+
+    TickPick is a no-fee marketplace.  The performer page
+    (``/world-cup-soccer-tickets/``) loads a first batch of ~20 events in the
+    RSC payload with prices.  MetLife event URLs beyond that batch are also
+    present in the HTML.  For any MetLife events missing price data, we scrape
+    their individual event pages.
+    """
+    performer_url = "https://www.tickpick.com/world-cup-soccer-tickets/"
+    try:
+        html = _fetch_html_playwright(performer_url)
+    except Exception as exc:
+        logger.error("TickPick Playwright error: %s", exc)
+        return []
+
+    listings: list[dict] = []
+    seen_urls: set[str] = set()
+
+    try:
+        # --- Phase 1: RSC entityEvents (first ~20 events, includes prices) ---
+        events = _extract_tickpick_rsc_events(html)
+
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+
+            name = event.get("event_name") or event.get("description") or ""
+            if not any(kw in name.lower() for kw in _WC_KEYWORDS):
+                continue
+
+            venue_name = event.get("display_name") or ""
+            if not any(kw in venue_name.lower() for kw in _VENUE_KEYWORDS):
+                continue
+
+            stats = event.get("stats") or {}
+            min_price = stats.get("min")
+            if not min_price:
+                continue
+
+            date_str = (event.get("event_date") or "")[:10]
+            buy_url = event.get("buy_url") or ""
+            event_url = (
+                f"https://www.tickpick.com{buy_url}"
+                if buy_url and not buy_url.startswith("http")
+                else buy_url or "https://www.tickpick.com"
+            )
+
+            listings.append({
+                "game": name,
+                "date": date_str,
+                "section": "any",
+                "price": float(min_price),
+                "url": event_url,
+                "source": "tickpick",
+            })
+            seen_urls.add(event_url)
+
+        # --- Phase 2: find MetLife event links not yet covered ---
+        metlife_links = re.findall(
+            r'href="(/buy-fifa-world-cup[^"]*metlife[^"]*)"', html, re.IGNORECASE
+        )
+        # De-duplicate and strip HTML entities
+        extra_paths: list[str] = []
+        for raw_path in metlife_links:
+            path = raw_path.split("?")[0].replace("&amp;", "&")
+            full = f"https://www.tickpick.com{path}"
+            if full not in seen_urls:
+                extra_paths.append(path)
+                seen_urls.add(full)
+
+        if extra_paths:
+            logger.info(
+                "TickPick: %d MetLife event(s) not in first batch — scraping individual pages.",
+                len(extra_paths),
+            )
+
+        for path in extra_paths:
+            full_url = f"https://www.tickpick.com{path}"
+            info = _scrape_tickpick_event_page(full_url)
+            if info:
+                listings.append({
+                    "game": info["game"],
+                    "date": info["date"],
+                    "section": "any",
+                    "price": info["price"],
+                    "url": full_url,
+                    "source": "tickpick",
+                })
+            time.sleep(3)  # polite delay between individual page scrapes
+
+    except Exception as exc:
+        logger.warning("TickPick data parsing failed: %s", exc)
+
+    logger.info("TickPick: %d World Cup listing(s) at MetLife.", len(listings))
+    return listings
+
+
+# ---------------------------------------------------------------------------
 # Gametime adapter  (mobile API — no auth required)
 # ---------------------------------------------------------------------------
 
@@ -529,30 +705,44 @@ def fetch_vividseats() -> list[dict]:
 _GAMETIME_PERFORMER_ID = "66f70bca07991b85a6c55ad9"
 
 
+_GAMETIME_MAX_PAGES = 10  # safety limit
+
+
 def fetch_gametime() -> list[dict]:
     """
     Query Gametime's mobile API for FIFA World Cup events at MetLife Stadium.
 
     Uses the undocumented-but-public mobile API endpoint.  Prices are returned
-    in cents and converted to dollars.  Only NJ events are requested so the
-    venue filter is just a sanity check.
+    in cents and converted to dollars.  Paginates until ``more`` is False.
+    Only NJ events are requested so the venue filter is just a sanity check.
     """
-    try:
-        data = _fetch_json(
-            "https://mobile.gametime.co/v1/events",
-            params={
-                "performer_id": _GAMETIME_PERFORMER_ID,
-                "venue_state": "NJ",
-                "page": 1,
-                "per_page": 50,
-            },
-        )
-    except Exception as exc:
-        logger.error("Gametime API error: %s", exc)
-        return []
+    all_items: list[dict] = []
+    page = 1
+    while page <= _GAMETIME_MAX_PAGES:
+        try:
+            data = _fetch_json(
+                "https://mobile.gametime.co/v1/events",
+                params={
+                    "performer_id": _GAMETIME_PERFORMER_ID,
+                    "venue_state": "NJ",
+                    "page": page,
+                    "per_page": 50,
+                },
+            )
+        except Exception as exc:
+            logger.error("Gametime API error (page %d): %s", page, exc)
+            break
+
+        events = data.get("events", [])
+        all_items.extend(events)
+        logger.debug("Gametime: page %d returned %d event(s).", page, len(events))
+
+        if not data.get("more") or not events:
+            break
+        page += 1
 
     listings: list[dict] = []
-    for item in data.get("events", []):
+    for item in all_items:
         if not isinstance(item, dict):
             continue
         ev = item.get("event", {})
@@ -566,12 +756,15 @@ def fetch_gametime() -> list[dict]:
         if not any(kw in venue_name.lower() for kw in _VENUE_KEYWORDS):
             continue
 
-        min_price_obj = ev.get("min_price") or {}
-        price_cents = (
-            min_price_obj.get("total") or min_price_obj.get("prefee")
-            if isinstance(min_price_obj, dict)
-            else None
-        )
+        min_price_obj = ev.get("min_price")
+        if min_price_obj is None:
+            min_price_obj = {}
+        if isinstance(min_price_obj, dict):
+            price_cents = min_price_obj.get("total") or min_price_obj.get("pre_fee") or min_price_obj.get("prefee")
+        elif isinstance(min_price_obj, (int, float)):
+            price_cents = min_price_obj
+        else:
+            price_cents = None
         if not price_cents:
             continue
 
@@ -601,10 +794,11 @@ def fetch_gametime() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 _ADAPTERS: list[tuple[str, callable]] = [
-    ("Ticketmaster", fetch_ticketmaster),
-    ("SeatGeek",     fetch_seatgeek),
-    ("StubHub",      fetch_stubhub),
-    ("Vivid Seats",  fetch_vividseats),
+    # ("Ticketmaster", fetch_ticketmaster),
+    # ("SeatGeek",     fetch_seatgeek),
+    # ("StubHub",      fetch_stubhub),
+    # ("Vivid Seats",  fetch_vividseats),
+    ("TickPick",     fetch_tickpick),
     ("Gametime",     fetch_gametime),
 ]
 

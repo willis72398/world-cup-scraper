@@ -1,8 +1,8 @@
 """
 FIFA World Cup 2026 Ticket Price Bot
 
-Polls five ticketing sites (Ticketmaster, SeatGeek, StubHub, Vivid Seats,
-Gametime) for World Cup games at MetLife Stadium in East Rutherford, NJ.
+Polls six ticketing sites (Ticketmaster, SeatGeek, StubHub, Vivid Seats,
+TickPick, Gametime) for World Cup games at MetLife Stadium in East Rutherford, NJ.
 When a listing's price drops at or below a configured per-section threshold,
 an SMS is sent to every contact in WORLDCUP_NOTIFY_PHONES via email-to-SMS
 gateway.  Duplicate alerts within a 6-hour cooldown window are suppressed
